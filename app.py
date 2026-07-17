@@ -144,7 +144,7 @@ with tab_img:
             pil_img = Image.open(item)
             res = apply_image_watermark(pil_img, wm_type, wm_text, logo_data, wm_pos, wm_opacity, wm_rot)
             
-            st.image(res, caption=f"Preview: {item.name}", max_width=350)
+            st.image(res, caption=f"Preview: {item.name}", width=350)
             out_buf = io.BytesIO()
             res.save(out_buf, format="JPEG")
             st.download_button(f"Download Protected {item.name}", out_buf.getvalue(), file_name=f"wm_{item.name}", mime="image/jpeg")
