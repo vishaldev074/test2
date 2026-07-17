@@ -8,6 +8,7 @@ from pypdf import PdfReader, PdfWriter
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
 from docx import Document
+from docx.shared import Pt, RGBColor
 from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
 
 # --- Helper Logic: Position Maps ---
@@ -27,21 +28,29 @@ def get_position_coords(base_w, base_h, wm_w, wm_h, position_name, padding=20):
 
 # --- Core Processor Engine: Images ---
 
-def apply_image_watermark(orig_img, wm_type, text, logo_file, pos, opacity, rotation):
+def apply_image_watermark(orig_img, wm_type, text, logo_file, pos, opacity, rotation, color, size):
     base = orig_img.convert("RGBA")
     wm_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(wm_layer)
     
-    # Render Asset Type
     if wm_type == "Text" and text:
-        font = ImageFont.load_default()
+        # Load font with the requested dynamic size scale
+        try:
+            font = ImageFont.load_default(size=size)
+        except TypeError:
+            font = ImageFont.load_default()
+            
         bbox = draw.textbbox((0, 0), text, font=font)
         tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
         
-        # Create separate canvas for text rotation
+        # Translate the Hex color to an RGB layout array
+        hex_c = color.lstrip('#')
+        r, g, b = tuple(int(hex_c[i:i+2], 16) for i in (0, 2, 4))
+        
+        # Create separate canvas for text rotation and color fill
         text_canvas = Image.new("RGBA", (tw + 10, th + 10), (0, 0, 0, 0))
         text_draw = ImageDraw.Draw(text_canvas)
-        text_draw.text((5, 5), text, font=font, fill=(255, 255, 255, int(opacity * 255)))
+        text_draw.text((5, 5), text, font=font, fill=(r, g, b, int(opacity * 255)))
         rotated_txt = text_canvas.rotate(rotation, expand=True)
         
         x, y = get_position_coords(base.size[0], base.size[1], rotated_txt.size[0], rotated_txt.size[1], pos)
@@ -49,7 +58,12 @@ def apply_image_watermark(orig_img, wm_type, text, logo_file, pos, opacity, rota
         
     elif wm_type == "Logo" and logo_file:
         logo = Image.open(logo_file).convert("RGBA")
-        logo.thumbnail((base.size[0] // 4, base.size[1] // 4))
+        
+        # Scale logo relative to the base image and size slider configuration
+        scale_factor = size / 200.0
+        new_width = max(10, int(base.size[0] * scale_factor))
+        new_height = max(10, int(new_width * (logo.height / logo.width)))
+        logo = logo.resize((new_width, new_height), Image.Resampling.LANCZOS)
         
         # Opacity overlay adjustments
         alpha = logo.split()[3]
@@ -64,7 +78,7 @@ def apply_image_watermark(orig_img, wm_type, text, logo_file, pos, opacity, rota
 
 # --- Core Processor Engine: PDFs ---
 
-def create_pdf_overlay(wm_type, text, logo_bytes, pos, opacity, rotation):
+def create_pdf_overlay(wm_type, text, logo_bytes, pos, opacity, rotation, color, size):
     """Generates a temporary vector layer page using ReportLab canvas arrays."""
     packet = io.BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
@@ -72,10 +86,8 @@ def create_pdf_overlay(wm_type, text, logo_bytes, pos, opacity, rotation):
     
     # Establish Alpha/Opacity Layer settings
     can.setFillAlpha(opacity)
-    can.setFillColorRGB(0.5, 0.5, 0.5)
     
     # Basic translation coordinates map for standard ReportLab Letter Layout
-    # Mapping points roughly matching positional quadrants
     w, h = letter
     x, y = w / 2, h / 2
     if pos == "Top Left": x, y = 70, h - 70
@@ -87,14 +99,19 @@ def create_pdf_overlay(wm_type, text, logo_bytes, pos, opacity, rotation):
     can.rotate(rotation)
     
     if wm_type == "Text" and text:
-        can.setFont("Helvetica-Bold", 36)
+        hex_c = color.lstrip('#')
+        r, g, b = [int(hex_c[i:i+2], 16)/255.0 for i in (0, 2, 4)]
+        can.setFillColorRGB(r, g, b)
+        can.setFont("Helvetica-Bold", size)
         can.drawCentredString(0, 0, text)
+        
     elif wm_type == "Logo" and logo_bytes:
-        # Save temporary file asset to pass directly down to reportlab drawImage layer
         with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tf:
             tf.write(logo_bytes)
             tf_name = tf.name
-        can.drawImage(tf_name, -50, -50, width=100, height=100, mask='auto')
+            
+        logo_w, logo_h = size * 3, size * 3
+        can.drawImage(tf_name, -logo_w/2, -logo_h/2, width=logo_w, height=logo_h, mask='auto')
         os.remove(tf_name)
         
     can.restoreState()
@@ -104,13 +121,19 @@ def create_pdf_overlay(wm_type, text, logo_bytes, pos, opacity, rotation):
 
 # --- Core Processor Engine: Word Documents ---
 
-def watermark_docx(doc_bytes, text):
+def watermark_docx(doc_bytes, text, color, size):
     """Injects warning strings structurally into the document body headers."""
     doc = Document(io.BytesIO(doc_bytes))
+    hex_c = color.lstrip('#') if color else "808080"
+    
     for section in doc.sections:
         header = section.header
         hp = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
-        hp.text = f"[{text}] - CONFIDENTIAL REVIEW TRACKER "
+        hp.text = ""  # Clear any existing paragraph strings
+        
+        run = hp.add_run(f"[{text}] - SECURED WATERMARK")
+        run.font.size = Pt(size)
+        run.font.color.rgb = RGBColor(int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16))
         hp.alignment = 2  # Right-aligned header context layout
     
     out_io = io.BytesIO()
@@ -123,14 +146,19 @@ st.set_page_config(page_title="AI Watermark Studio", page_icon="🛡️", layout
 st.title("🛡️ AI Watermark Studio")
 st.markdown("Secure and verify your digital assets. Apply watermarks seamlessly to images, videos, and documentation structures.")
 
-# Shared Control Parameters System Layout in Sidebar Context
+# --- Sidebar Parameter Controls ---
 st.sidebar.title("⚙️ Watermark Configurations")
 wm_type = st.sidebar.radio("Watermark Medium Style", ["Text", "Logo"])
 wm_text = st.sidebar.text_input("Watermark Plain Text", value="DRAFT") if wm_type == "Text" else None
 logo_data = st.sidebar.file_uploader("Upload Image Logo Layer", type=["png", "jpg", "jpeg"]) if wm_type == "Logo" else None
 
+# New Color and Size Controllers
+wm_color = st.sidebar.color_picker("Watermark Color", "#FFFFFF") if wm_type == "Text" else None
+wm_size = st.sidebar.slider("Watermark Scale / Font Size", 10, 200, 50)
+
 wm_pos = st.sidebar.selectbox("Position Coordinates Layout", ["Center", "Top Left", "Top Right", "Bottom Left", "Bottom Right"])
-wm_opacity = st.sidebar.slider("Opacity Alpha Scale", 0.1, 1.0, 0.4, 0.05)
+# Updated Opacity logic (0.01 step interval for smooth tracking)
+wm_opacity = st.sidebar.slider("Opacity Alpha Scale", 0.0, 1.0, 0.8, 0.01)
 wm_rot = st.sidebar.slider("Rotation Matrix Angle (Degrees)", -180, 180, 0, 5)
 
 tab_img, tab_vid, tab_pdf, tab_docx = st.tabs(["🖼️ Images", "🎬 Videos", "📄 PDFs", "📝 Word Docs"])
@@ -142,7 +170,7 @@ with tab_img:
     if img_uploads:
         for item in img_uploads:
             pil_img = Image.open(item)
-            res = apply_image_watermark(pil_img, wm_type, wm_text, logo_data, wm_pos, wm_opacity, wm_rot)
+            res = apply_image_watermark(pil_img, wm_type, wm_text, logo_data, wm_pos, wm_opacity, wm_rot, wm_color, wm_size)
             
             st.image(res, caption=f"Preview: {item.name}", width=350)
             out_buf = io.BytesIO()
@@ -162,9 +190,8 @@ with tab_vid:
                 
                 try:
                     clip = VideoFileClip(t_input.name)
-                    # Use a fast in-memory Pillow canvas block to create image elements to overlay onto MoviePy
                     dummy = Image.new("RGBA", (clip.size[0], clip.size[1]), (0,0,0,0))
-                    wm_frame = apply_image_watermark(dummy, wm_type, wm_text, logo_data, wm_pos, wm_opacity, wm_rot)
+                    wm_frame = apply_image_watermark(dummy, wm_type, wm_text, logo_data, wm_pos, wm_opacity, wm_rot, wm_color, wm_size)
                     
                     t_img = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
                     wm_frame.save(t_img.name)
@@ -198,7 +225,7 @@ with tab_pdf:
                 writer = PdfWriter()
                 
                 logo_bytes_data = logo_data.read() if logo_data else None
-                overlay_page = create_pdf_overlay(wm_type, wm_text, logo_bytes_data, wm_pos, wm_opacity, wm_rot)
+                overlay_page = create_pdf_overlay(wm_type, wm_text, logo_bytes_data, wm_pos, wm_opacity, wm_rot, wm_color, wm_size)
                 
                 for idx in range(len(reader.pages)):
                     page = reader.pages[idx]
@@ -220,7 +247,7 @@ with tab_docx:
         if st.button("Apply Document Header Stamp"):
             try:
                 stamp_text = wm_text if wm_text else "SECURED DATA"
-                docx_res = watermark_docx(docx_file.read(), stamp_text)
+                docx_res = watermark_docx(docx_file.read(), stamp_text, wm_color, wm_size)
                 st.success("Global headers injected throughout XML document layers.")
                 st.download_button("Download Processed DOCX File", docx_res, file_name="secured_document.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
             except Exception as e:
